@@ -105,7 +105,7 @@ class MinerUClient:
         for path, url in zip(file_paths, file_urls):
             with open(path, "rb") as f:
                 file_data = f.read()
-            put_resp = requests.put(url, data=file_data)
+            put_resp = requests.put(url, data=file_data, timeout=600)
             if put_resp.status_code not in (200, 201, 204):
                 raise RuntimeError(
                     f"Upload failed for {os.path.basename(path)}: "
@@ -152,8 +152,8 @@ class MinerUClient:
             print(f"  [{done}/{len(results)}] done, {elapsed:.0f}s elapsed", end="\r")
             time.sleep(poll_interval)
 
-    def download_and_extract(self, result: dict, output_dir: str) -> str:
-        """Download the result ZIP and extract full.md. Returns path to .md file."""
+    def download_and_extract(self, result: dict, output_dir: str) -> tuple:
+        """Download ZIP and extract everything. Returns (md_path, extract_dir)."""
         zip_url = result["full_zip_url"]
         file_name = result["file_name"]
         base_name = Path(file_name).stem
@@ -161,18 +161,21 @@ class MinerUClient:
         resp = requests.get(zip_url)
         resp.raise_for_status()
 
-        os.makedirs(output_dir, exist_ok=True)
+        chunk_dir = os.path.join(output_dir, base_name)
+        os.makedirs(chunk_dir, exist_ok=True)
 
         with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            md_names = [n for n in zf.namelist() if n.endswith(".md")]
-            src = "full.md" if "full.md" in md_names else md_names[0]
-            content = zf.read(src).decode("utf-8")
+            zf.extractall(chunk_dir)
 
-        md_path = os.path.join(output_dir, f"{base_name}.md")
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        md_path = os.path.join(chunk_dir, "full.md")
+        if not os.path.isfile(md_path):
+            md_files = list(Path(chunk_dir).glob("*.md"))
+            if md_files:
+                md_path = str(md_files[0])
+            else:
+                raise RuntimeError(f"No .md file found in ZIP for {file_name}")
 
-        return md_path
+        return md_path, chunk_dir
 
 
 # ---------------------------------------------------------------------------
@@ -251,17 +254,48 @@ class PDFSplitter:
 
 
 # ---------------------------------------------------------------------------
-# Markdown Merger
+# Output helpers
 # ---------------------------------------------------------------------------
 
-def merge_markdown(md_paths: List[str], output_path: str) -> None:
-    """Concatenate markdown files in sorted order."""
-    md_paths = sorted(md_paths)
+def _copy_images(src_dir: str, dst_dir: str) -> None:
+    """Copy images/ folder from src_dir into dst_dir/images/."""
+    src_images = os.path.join(src_dir, "images")
+    if not os.path.isdir(src_images):
+        return
+    dst_images = os.path.join(dst_dir, "images")
+    os.makedirs(dst_images, exist_ok=True)
+    for f in os.listdir(src_images):
+        src = os.path.join(src_images, f)
+        dst = os.path.join(dst_images, f)
+        if os.path.isfile(src):
+            shutil.copy2(src, dst)
+
+
+def install_output(md_path: str, extract_dir: str, output_path: str) -> None:
+    """Copy a single chunk's .md and images/ to the final output location."""
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(output_dir, exist_ok=True)
+    shutil.copy(md_path, output_path)
+    _copy_images(extract_dir, output_dir)
+
+
+def merge_markdown(
+    md_paths: List[str],
+    extract_dirs: List[str],
+    output_path: str,
+) -> None:
+    """Merge markdown files and images from split chunks into a single output."""
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(output_dir, exist_ok=True)
+
+    pairs = sorted(zip(md_paths, extract_dirs), key=lambda x: x[0])
+
     with open(output_path, "w", encoding="utf-8") as out:
-        for i, path in enumerate(md_paths):
-            with open(path, "r", encoding="utf-8") as f:
+        for i, (md_path, extract_dir) in enumerate(pairs):
+            with open(md_path, "r", encoding="utf-8") as f:
                 out.write(f.read())
-            if i < len(md_paths) - 1:
+            _copy_images(extract_dir, output_dir)
+            if i < len(pairs) - 1:
                 out.write("\n\n---\n\n")
 
 
@@ -314,18 +348,20 @@ def process_single_pdf(
             )
             all_results.extend(results)
 
-        # Step 3: Download and extract
+        # Step 3: Download and extract (md + images)
         md_dir = os.path.join(work_dir, "md")
         md_files = []
+        extract_dirs = []
         for result in all_results:
-            md_path = client.download_and_extract(result, md_dir)
+            md_path, extract_dir = client.download_and_extract(result, md_dir)
             md_files.append(md_path)
+            extract_dirs.append(extract_dir)
 
-        # Step 4: Merge or copy
+        # Step 4: Merge or copy (with images)
         if len(md_files) > 1:
-            merge_markdown(md_files, output_path)
+            merge_markdown(md_files, extract_dirs, output_path)
         else:
-            shutil.copy(md_files[0], output_path)
+            install_output(md_files[0], extract_dirs[0], output_path)
 
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
